@@ -4,9 +4,9 @@
 
 OpenLetter is a simple service for writing a public email to one or more recipients.
 
-A creator writes a letter in an email-like compose interface, sends it to recipient email addresses, and publishes it at a stable public URL. The public page lets anyone sign the letter with a passkey when available, or with email + 6-digit confirmation when passkeys are unavailable. Recipient replies by email are automatically published below the open letter, and signatories who opted in are notified.
+A creator writes a letter in an email-like compose interface, can share a clearly marked draft for private feedback before publishing, then sends it to named recipient email addresses and publishes it at a stable public URL. The public page lets anyone sign the letter with a display name + email + 6-digit confirmation. Recipient replies by email are routed back to the full thread with a link to preview, redact, and publish the response; anyone in the thread can publish after previewing.
 
-The product should stay intentionally small: one web app, one SQLite database, one Docker container, and deployable to Vercel-compatible or Coolify-style environments.
+The product should stay intentionally small for v1: one web app, one SQLite database, one Docker container, and deployable to Coolify-style environments. Vercel support is out of scope for v1.
 
 ## 2. Goals
 
@@ -14,11 +14,9 @@ The product should stay intentionally small: one web app, one SQLite database, o
 - Make the public nature of the letter explicit before publishing.
 - Send the initial letter by email to recipients while also publishing it online.
 - Avoid leaking recipient email addresses on the public page.
-- Let people sign with minimal friction:
-  - passkey/WebAuthn when supported;
-  - email + 6-digit confirmation as fallback.
+- Let people sign with minimal friction using display name + email + 6-digit confirmation.
 - Let signatories optionally subscribe to recipient responses.
-- Automatically publish recipient replies sent by email.
+- Let people in the recipient email thread preview, redact, and publish recipient replies received by email.
 - Notify the right people at signature milestones and when responses arrive.
 - Keep deployment simple: SQLite, one container, minimal moving parts.
 
@@ -36,10 +34,8 @@ The product should stay intentionally small: one web app, one SQLite database, o
 
 - Framework: Next.js + TypeScript.
 - Database: SQLite.
-- ORM/query layer: Drizzle ORM or Prisma with SQLite; choose the simplest option that works well in Docker and serverless-like environments.
-- Auth/signing:
-  - WebAuthn/passkeys for signing where supported.
-  - Email one-time-code fallback.
+- ORM/query layer: Drizzle ORM or Prisma with SQLite; choose the simplest option that works well in a single Docker container.
+- Auth/signing: email one-time-code confirmation for v1. Passkeys/WebAuthn are explicitly deferred.
 - Email provider: Resend.
 - Inbound email: Resend inbound webhook.
 - Markdown rendering: server-side sanitized Markdown with a client preview.
@@ -53,13 +49,13 @@ Fields:
 
 - `id`: internal unique ID.
 - `slug`: public stable URL identifier.
-- `status`: `draft`, `preview`, `published`, `archived`.
-- `author_email`: private; used for confirmations and milestone updates.
-- `author_display_name`: optional public display name.
+- `status`: `draft`, `published`, `archived`.
+- `author_email`: private; used for confirmations, cc on outbound threads, and milestone updates.
+- `author_display_name`: required public display name for v1.
 - `subject`: public.
 - `body_markdown`: public once published.
 - `body_html_sanitized`: rendered public HTML cache.
-- `recipient_summary`: public safe label, e.g. `3 recipients` or manually supplied recipient names if later supported.
+- `recipient_summary`: public safe label based on recipient display names only, e.g. `Jane Doe, ACME Support, and 2 others`; never includes email addresses.
 - `created_at`, `updated_at`, `published_at`.
 - `last_milestone_sent`: null or one of `100`, `1000`, `10000`, `100000`, `1000000`.
 
@@ -73,7 +69,7 @@ Fields:
 - `letter_id`.
 - `email`: private, never displayed publicly unless explicitly included in a published reply by the recipient.
 - `kind`: `to` or `cc`.
-- `display_name`: optional private or semi-private label.
+- `display_name`: required public-safe name/label used in logs and recipient summaries.
 - `created_at`.
 
 ### 5.3 Signature
@@ -83,16 +79,16 @@ Fields:
 - `id`.
 - `letter_id`.
 - `signer_display_name`: public name.
-- `signer_email`: private, nullable when passkey-only signer does not provide email.
+- `signer_email`: private, nullable after confirmation if the signer did not opt into response notifications.
+- `signer_email_hash`: salted hash used for dedupe when raw email is deleted.
 - `email_verified_at`: nullable.
-- `passkey_credential_id`: nullable.
 - `notify_on_response`: boolean.
 - `signed_at`.
 - `confirmation_snapshot_sent_at`: nullable.
 
 Rules:
 
-- A person can sign once per letter per verified email or passkey credential.
+- A person can sign once per letter per verified email hash.
 - Public signature list shows display name and signing timestamp, not email address by default.
 
 ### 5.4 EmailVerificationCode
@@ -109,20 +105,7 @@ Fields:
 - `attempt_count`.
 - `created_at`.
 
-### 5.5 PasskeyCredential
-
-Fields:
-
-- `id`.
-- `credential_id`.
-- `public_key`.
-- `counter`.
-- `signer_email`: nullable.
-- `signer_display_name`.
-- `created_at`.
-- `last_used_at`.
-
-### 5.6 EmailMessage
+### 5.5 EmailMessage
 
 Stores outbound and inbound email metadata.
 
@@ -141,7 +124,7 @@ Fields:
 - `raw_payload_json`: private; inbound webhook/debug only.
 - `created_at`.
 
-### 5.7 RecipientResponse
+### 5.6 RecipientResponse
 
 Fields:
 
@@ -151,10 +134,51 @@ Fields:
 - `from_email_private`.
 - `from_display_name_public`: public.
 - `subject`.
-- `body_text`.
-- `body_html_sanitized`.
+- `body_text_original`: private original extracted text.
+- `body_text_redacted`: public text after publisher redaction.
+- `body_html_sanitized`: public sanitized/redacted HTML.
 - `received_at`.
+- `preview_token_hash`: token allowing anyone in the email thread to open the preview/redaction page.
+- `previewed_at`: nullable.
 - `published_at`.
+
+### 5.7 ActivityLog
+
+Public-safe event log for each letter.
+
+Fields:
+
+- `id`.
+- `letter_id`.
+- `event_type`: `draft_created`, `published`, `initial_email_sent`, `milestone_email_sent`, `response_received`, `response_published`, `signature_created`.
+- `public_text`: pre-rendered public-safe log text; never includes email addresses.
+- `private_metadata_json`: private structured details for debugging/audit.
+- `created_at`.
+
+Rules:
+
+- The public page shows a compact chronological log.
+- Log recipient activity by display name, not email address.
+- Include delivery-related events such as initial email sent, milestone notification sent, response received, and response published.
+
+### 5.8 EmailSubscription
+
+Tracks response-notification subscriptions independently from signatures.
+
+Fields:
+
+- `id`.
+- `email`: private.
+- `email_hash`: salted hash for lookup/dedupe.
+- `letter_id`.
+- `active`: boolean.
+- `created_at`, `unsubscribed_at`.
+
+Rules:
+
+- One-click unsubscribe disables the subscription for that letter.
+- The unsubscribe page also shows other active subscriptions for the same email, if any.
+- If there are no remaining active subscriptions for that email, remove the raw email address entirely from the database and tell the user it was removed; retain only salted hashes needed for dedupe/audit.
 
 ## 6. Public routes
 
@@ -165,7 +189,7 @@ Simple landing page explaining:
 - write a public email;
 - send it to recipients;
 - collect signatures;
-- recipient replies are published publicly.
+- recipient replies can be previewed, redacted, and published publicly by people in the email thread.
 
 Primary CTA: `Write an open letter` → `/new`.
 
@@ -180,13 +204,13 @@ Layout:
 
 Main compose fields:
 
-- `To`: recipient email addresses, multiple allowed.
-- `Cc`: optional recipient email addresses, multiple allowed.
+- `To`: named recipient rows (`name`, `email`), multiple allowed.
+- `Cc`: optional named recipient rows (`name`, `email`), multiple allowed.
 - `Subject`.
 - `Body`: Markdown editor.
 - Markdown preview toggle or side-by-side preview.
 - Author email.
-- Optional author display name.
+- Author display name.
 
 Required explicit disclosure near CTA:
 
@@ -203,12 +227,12 @@ Right column content:
   2. Preview the public page and outgoing email.
   3. Publish to send it to recipients and create a public URL.
   4. Anyone can sign the public letter.
-  5. Recipient replies are automatically published below the letter.
+  5. Recipient replies can be previewed, redacted, and published by anyone in the email thread.
 - FAQ:
   - Are recipient email addresses public? No.
   - What happens when I publish? The email is sent and the public page goes live.
-  - Can recipients reply? Yes, replies are published on the public page.
-  - How do people sign? With passkey if available, otherwise email confirmation.
+  - Can recipients reply? Yes. Replies are emailed to the thread with a publish button; anyone in the thread can preview, redact, and publish them.
+  - How do people sign? With display name, email, and a 6-digit confirmation code.
   - Can signatories get notified? Yes, if they enter an email and opt in.
 
 ### 6.3 `POST /api/letters/preview`
@@ -218,27 +242,27 @@ Creates or updates a preview letter.
 Validation:
 
 - At least one `To` recipient.
-- Valid emails for `To`, optional valid emails for `Cc`.
+- Valid names and emails for `To`, optional valid names and emails for `Cc`.
 - Non-empty subject.
 - Non-empty Markdown body.
 - Valid author email.
 
 Returns:
 
-- preview URL, e.g. `/letters/{slug}?preview=1`.
+- draft preview URL, e.g. `/letters/{slug}?draft=1&token={shareToken}`.
 
-No recipient email is sent at this stage.
+No recipient email is sent at this stage. The draft URL can be shared for feedback before publishing, must be clearly marked as a draft, and must not allow signing.
 
-### 6.4 `GET /letters/{slug}?preview=1`
+### 6.4 `GET /letters/{slug}?draft=1&token={shareToken}`
 
-Preview page.
+Draft preview page for creator review and share-before-publish feedback.
 
 Must show:
 
-- status badge: `Preview`.
+- status badge: `Draft — not published`.
 - final URL that will be used after publishing.
 - rendered public letter.
-- signature module disabled or clearly marked as unavailable until published.
+- signature module hidden or disabled with clear copy that people cannot sign drafts.
 - preview of the outgoing email that recipients will receive.
 - buttons:
   - `Back to edit`.
@@ -246,7 +270,7 @@ Must show:
 
 Copy near publish CTA:
 
-> Publishing will send this open letter to the recipients you entered and make it publicly available at this URL. Any recipient reply by email will automatically be published here and shared with signatories who opted in.
+> Publishing will send this open letter to the recipients you entered and make it publicly available at this URL. Any recipient reply by email can be previewed, redacted, and published here by people in the email thread, then shared with signatories who opted in.
 
 ### 6.5 `POST /api/letters/{slug}/publish`
 
@@ -256,8 +280,8 @@ Rules:
 
 - Only preview/draft letters can be published.
 - Publishing is idempotent: repeated calls do not send duplicate initial emails.
-- Initial email is sent to `To` and `Cc` recipients, plus author copy if desired.
-- Public page becomes available without `preview=1`.
+- Initial email is sent to `To` and `Cc` recipients, and the author is always cc'ed so they stay in the email thread.
+- Public page becomes available without the draft token.
 
 ### 6.6 `GET /letters/{slug}`
 
@@ -273,19 +297,15 @@ Shows:
 - signature list.
 - sign form.
 - recipient responses below the letter.
+- mini activity log with public-safe events such as `Sent to Jane Doe and ACME Support by email on {datetime}`, `100 signatures notification sent to Jane Doe and ACME Support on {datetime}`, `Response received on {datetime}`, and `Response published on {datetime}`.
 
 Sign form:
 
-- If passkey/WebAuthn is available:
-  - sign with passkey as primary flow;
-  - optionally collect email for response notifications.
-- If passkey is unavailable or the user chooses email fallback:
-  - collect display name + email;
-  - send 6-digit code;
-  - confirm code;
-  - create signature.
-- In both flows:
-  - allow `Notify me when there is a response` if an email is provided.
+- Collect display name + email.
+- Send a 6-digit code.
+- Confirm code before creating the public signature.
+- Allow `Notify me when there is a response`.
+- If the signer does not opt into response notifications, delete the raw email address after confirmation and keep only a salted hash for dedupe.
 
 ## 7. Email behavior
 
@@ -296,7 +316,7 @@ Sent when creator publishes.
 Recipients:
 
 - All `To` and `Cc` email addresses.
-- Author may receive a copy.
+- Author is cc'ed.
 
 Must include:
 
@@ -305,16 +325,16 @@ Must include:
 - Public URL.
 - Clear disclosure:
 
-> This is an open letter that is also published at {url}. Any response to this email will automatically be published there and shared with signatories who asked to be notified.
+> This is an open letter that is also published at {url}. Any response to this email can be published there after someone in this email thread clicks the publish link, previews the response, and confirms. You will be able to redact private information before publishing.
 
 Reply handling:
 
 - The `Reply-To` or inbound address should encode the letter ID/slug so Resend inbound webhook can route replies to the correct letter.
 - Example: `reply+{letterId}@inbound.openletter.earth`.
 
-### 7.2 Signature confirmation email
+### 7.2 Signature code and confirmation emails
 
-Sent to a signer when they sign and provide an email.
+A 6-digit code is sent before signing. After the code is verified and the signature is created, a confirmation email is sent to the signer.
 
 Recipients:
 
@@ -327,6 +347,10 @@ Must include:
 - Current list of signatories.
 - Public URL.
 - Notification preference status.
+
+Retention rule:
+
+- If `notify_on_response` is false, remove the raw signer email after sending confirmation and keep only a salted hash for duplicate-signature prevention.
 
 ### 7.3 Milestone email
 
@@ -341,7 +365,7 @@ Triggered when signature count crosses one of these levels:
 Recipients:
 
 - Original letter recipients.
-- Author.
+- Author cc'ed.
 - Not all signatories.
 
 Must include:
@@ -349,28 +373,38 @@ Must include:
 - Current signature count.
 - Public URL.
 - Full list of signatories.
-- Reminder that any recipient response will be published publicly.
+- Reminder that any recipient response can be previewed, redacted, and published publicly by people in the email thread.
 
 Rules:
 
 - Send each milestone at most once per letter.
 - If a letter jumps from 99 to 1,001 signatures, send the highest newly crossed milestone or send sequential milestones according to product decision; default v1 behavior: send only the highest newly crossed milestone to avoid spam.
 
-### 7.4 Recipient response notification
+### 7.4 Recipient response preview, publication, and notification
 
-Triggered when an inbound recipient reply is published.
+Triggered when an inbound recipient reply is received from a valid thread participant.
 
-Recipients:
+Thread recipients before publication:
+
+- Reply to everyone in the original thread and always cc the author, even if the inbound email omitted them.
+
+Must include before publication:
+
+- A button/link to preview and publish the response.
+- Clear copy that publication will first show a preview.
+- Clear copy that the publisher can redact private information or PII before publishing.
+
+Recipients after publication:
 
 - Signatories who provided an email and opted into response notifications.
-- Author may receive a copy.
 
-Must include:
+Must include after publication:
 
 - Public URL.
 - Responder public display name if available.
 - Response body excerpt.
 - Link to read full response.
+- One-click unsubscribe link.
 
 ## 8. Resend inbound webhook
 
@@ -383,11 +417,13 @@ Must include:
 - Verify webhook signature.
 - Parse inbound email.
 - Identify target letter from inbound address or message headers.
-- Confirm sender is one of the original recipients when possible.
+- Ignore automatic responses such as auto-replies, bounces, out-of-office messages, delivery status notifications, and mail with standard auto-submitted/list/bulk headers.
+- Confirm sender is one of the original recipients or the author/thread participants; if not, ignore the email.
 - Sanitize email body.
-- Create a `RecipientResponse`.
-- Publish the response below the letter.
-- Notify signatories who opted in.
+- Create a `RecipientResponse` in an unpublished preview state.
+- Reply to the email thread with a publish-preview link, always cc'ing the author.
+- Publish the response only after a thread participant previews, optionally redacts, and confirms publication.
+- Notify signatories who opted in after publication.
 
 ### 8.3 Privacy and safety
 
@@ -416,7 +452,7 @@ Minimum protections:
 - Verify Resend webhook signatures.
 - Ensure publish endpoint is idempotent.
 - Sanitize Markdown and inbound email HTML.
-- Add unsubscribe link for notification emails.
+- Add one-click unsubscribe link for notification emails.
 
 ## 11. Deployment constraints
 
@@ -437,13 +473,6 @@ Environment variables:
 - `RESEND_WEBHOOK_SECRET`.
 - `INBOUND_EMAIL_DOMAIN`.
 - `EMAIL_FROM`.
-- `WEBAUTHN_RP_ID`.
-- `WEBAUTHN_ORIGIN`.
-
-Vercel note:
-
-- SQLite on Vercel needs a persistent SQLite-compatible provider or mounted storage alternative. The app should keep the persistence layer abstract enough to use local SQLite in Docker/Coolify and a Vercel-compatible SQLite option if deployed there.
-
 Coolify note:
 
 - Preferred simple deployment target: one container with persistent volume mounted at `/data`.
@@ -452,8 +481,8 @@ Coolify note:
 
 ### Compose page
 
-- User can enter multiple `To` addresses.
-- User can enter optional `Cc` addresses.
+- User can enter multiple named `To` recipients with name + email.
+- User can enter optional named `Cc` recipients with name + email.
 - User can enter subject and Markdown body.
 - User can preview Markdown before creating preview.
 - Right column explains public publishing and reply behavior.
@@ -461,7 +490,7 @@ Coolify note:
 
 ### Preview page
 
-- Shows `Preview` status.
+- Shows `Draft — not published` status.
 - Shows final URL.
 - Shows rendered letter.
 - Shows outgoing recipient email preview.
@@ -472,17 +501,17 @@ Coolify note:
 ### Public page
 
 - Shows public letter without recipient emails.
-- Lets users sign with passkey where supported.
-- Provides email-code fallback.
+- Lets users sign with display name, email, and 6-digit code.
 - Lets signers provide email for response notifications.
 - Shows signatures and responses.
+- Shows a public-safe mini activity log.
 
 ### Email flows
 
 - Initial publish sends the letter to recipients.
 - Signature with email sends confirmation receipt with full letter and current signatories.
 - Milestone thresholds notify recipients + author only.
-- Recipient replies are published and notify opted-in signatories.
+- Recipient replies are previewed/redacted/published by thread participants, then notify opted-in signatories.
 
 ## 13. Initial implementation phases
 
@@ -490,7 +519,7 @@ Coolify note:
 
 - Create repository.
 - Add this product specification.
-- Decide final stack details for Next.js, SQLite, email, Markdown, and WebAuthn.
+- Decide final stack details for Next.js, SQLite, email, and Markdown.
 
 ### Phase 2: Skeleton app
 
@@ -514,22 +543,45 @@ Coolify note:
 ### Phase 5: Public page and signing
 
 - Implement public letter page.
-- Implement passkey signing.
-- Implement email-code fallback signing.
+- Implement email-code signing.
 - Implement signer confirmation email.
 
 ### Phase 6: Replies and notifications
 
 - Implement Resend inbound webhook.
-- Publish recipient responses.
+- Implement response preview/redaction/publish flow.
 - Notify opted-in signatories.
 - Implement milestone notification emails.
 
-## 14. Open product decisions
+## 14. Nostr integration option
+
+Nostr can strengthen censorship resistance, but it should complement the v1 database rather than replace it.
+
+Potential mapping:
+
+- The open letter can be published as a Nostr long-form content event (`kind 30023`) with title/summary/tags and canonical URL.
+- Each signature can optionally be mirrored as a signed reaction or custom event referencing the letter event.
+- Multiple relays can store and redistribute the letter/signature events, making takedown harder and enabling independent mirrors.
+
+Why this does not remove the need for a database in v1:
+
+- Email workflows still need private state: author email, recipient emails, inbound routing tokens, preview/publish tokens, unsubscribe state, webhook dedupe, redaction drafts, and abuse controls. This data must not be public on relays.
+- Nostr event deletion is best-effort, while this product needs reliable privacy behavior such as removing raw email addresses when they are no longer needed.
+- Signature dedupe, 6-digit code verification, notification subscriptions, and milestone emails require transactional state.
+- Relay availability and indexing are eventually consistent; the web app needs a reliable source of truth for previews, publishing, email sends, and activity logs.
+
+Recommended v1 stance:
+
+- Keep SQLite as the source of truth.
+- Design entities with optional `nostr_event_id`, `nostr_pubkey`, and `nostr_published_at` fields later if/when mirroring is added.
+- Add Nostr as a v1.1/v2 publishing/mirroring layer after core email + signing flows work.
+- Explore Nostr-native signing only after deciding the UX for non-Nostr users and how to reconcile Nostr signatures with email-code signatures.
+
+## 15. Open product decisions
 
 - Should author email verification be required before preview or only before publish? Recommended: before publish.
-- Should recipient display names be supported in v1 or only raw private emails? Recommended: emails only in v1.
-- Should signer display names be required? Recommended: yes, with email/passkey verification.
-- How should duplicate signatures be handled across passkey and email fallback? Recommended: dedupe by verified email when present, otherwise by passkey credential.
+- Should recipient display names be required in v1? Decision: yes, ask for both name and email.
+- Should signer display names be required? Recommended: yes, with email-code verification.
+- How should duplicate signatures be handled? Recommended: dedupe by salted verified-email hash.
 - Should milestone jumps send only the highest milestone or every crossed milestone? Recommended: highest newly crossed milestone only.
 - What should be the exact inbound email address format? Recommended: `reply+{letterId}@{inboundDomain}`.
